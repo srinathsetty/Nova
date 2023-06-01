@@ -1,16 +1,18 @@
 //! This module implements RelaxedR1CSSNARKTrait using Spartan that is generic
 //! over the polynomial commitment and evaluation argument (i.e., a PCS)
-pub mod polynomial;
+mod math;
+pub(crate) mod polynomial;
+pub mod pp;
 mod sumcheck;
 
 use crate::{
+  compute_digest,
   errors::NovaError,
   r1cs::{R1CSShape, RelaxedR1CSInstance, RelaxedR1CSWitness},
   traits::{
-    evaluation::EvaluationEngineTrait, snark::RelaxedR1CSSNARKTrait, AppendToTranscriptTrait,
-    ChallengeTrait, Group, TranscriptEngineTrait,
+    evaluation::EvaluationEngineTrait, snark::RelaxedR1CSSNARKTrait, Group, TranscriptEngineTrait,
   },
-  CommitmentKey,
+  Commitment, CommitmentKey,
 };
 use ff::Field;
 use itertools::concat;
@@ -19,12 +21,116 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sumcheck::SumcheckProof;
 
+fn powers<G: Group>(s: &G::Scalar, n: usize) -> Vec<G::Scalar> {
+  assert!(n >= 1);
+  let mut powers = Vec::new();
+  powers.push(G::Scalar::ONE);
+  for i in 1..n {
+    powers.push(powers[i - 1] * s);
+  }
+  powers
+}
+
+/// A type that holds a witness to a polynomial evaluation instance
+pub struct PolyEvalWitness<G: Group> {
+  p: Vec<G::Scalar>, // polynomial
+}
+
+impl<G: Group> PolyEvalWitness<G> {
+  fn pad(W: &[PolyEvalWitness<G>]) -> Vec<PolyEvalWitness<G>> {
+    // determine the maximum size
+    if let Some(n) = W.iter().map(|w| w.p.len()).max() {
+      W.iter()
+        .map(|w| {
+          let mut p = w.p.clone();
+          p.resize(n, G::Scalar::ZERO);
+          PolyEvalWitness { p }
+        })
+        .collect()
+    } else {
+      Vec::new()
+    }
+  }
+
+  fn weighted_sum(W: &[PolyEvalWitness<G>], s: &[G::Scalar]) -> PolyEvalWitness<G> {
+    assert_eq!(W.len(), s.len());
+    let mut p = vec![G::Scalar::ZERO; W[0].p.len()];
+    for i in 0..W.len() {
+      for j in 0..W[i].p.len() {
+        p[j] += W[i].p[j] * s[i]
+      }
+    }
+    PolyEvalWitness { p }
+  }
+
+  fn batch(p_vec: &[&Vec<G::Scalar>], s: &G::Scalar) -> PolyEvalWitness<G> {
+    let powers_of_s = powers::<G>(s, p_vec.len());
+    let mut p = vec![G::Scalar::ZERO; p_vec[0].len()];
+    for i in 0..p_vec.len() {
+      for (j, item) in p.iter_mut().enumerate().take(p_vec[i].len()) {
+        *item += p_vec[i][j] * powers_of_s[i]
+      }
+    }
+    PolyEvalWitness { p }
+  }
+}
+
+/// A type that holds a polynomial evaluation instance
+pub struct PolyEvalInstance<G: Group> {
+  c: Commitment<G>,  // commitment to the polynomial
+  x: Vec<G::Scalar>, // evaluation point
+  e: G::Scalar,      // claimed evaluation
+}
+
+impl<G: Group> PolyEvalInstance<G> {
+  fn pad(U: &[PolyEvalInstance<G>]) -> Vec<PolyEvalInstance<G>> {
+    // determine the maximum size
+    if let Some(ell) = U.iter().map(|u| u.x.len()).max() {
+      U.iter()
+        .map(|u| {
+          let mut x = vec![G::Scalar::ZERO; ell - u.x.len()];
+          x.extend(u.x.clone());
+          PolyEvalInstance { c: u.c, x, e: u.e }
+        })
+        .collect()
+    } else {
+      Vec::new()
+    }
+  }
+
+  fn batch(
+    c_vec: &[Commitment<G>],
+    x: &[G::Scalar],
+    e_vec: &[G::Scalar],
+    s: &G::Scalar,
+  ) -> PolyEvalInstance<G> {
+    let powers_of_s = powers::<G>(s, c_vec.len());
+    let e = e_vec
+      .iter()
+      .zip(powers_of_s.iter())
+      .map(|(e, p)| *e * p)
+      .fold(G::Scalar::ZERO, |acc, item| acc + item);
+    let c = c_vec
+      .iter()
+      .zip(powers_of_s.iter())
+      .map(|(c, p)| *c * *p)
+      .fold(Commitment::<G>::default(), |acc, item| acc + item);
+
+    PolyEvalInstance {
+      c,
+      x: x.to_vec(),
+      e,
+    }
+  }
+}
+
 /// A type that represents the prover's key
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct ProverKey<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> {
   pk_ee: EE::ProverKey,
   S: R1CSShape<G>,
+  vk_digest: G::Scalar, // digest of the verifier's key
 }
 
 /// A type that represents the verifier's key
@@ -33,6 +139,7 @@ pub struct ProverKey<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> {
 pub struct VerifierKey<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> {
   vk_ee: EE::VerifierKey,
   S: R1CSShape<G>,
+  digest: G::Scalar,
 }
 
 /// A succinct proof of knowledge of a witness to a relaxed R1CS instance
@@ -47,8 +154,7 @@ pub struct RelaxedR1CSSNARK<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> 
   sc_proof_inner: SumcheckProof<G>,
   eval_W: G::Scalar,
   sc_proof_batch: SumcheckProof<G>,
-  eval_E_prime: G::Scalar,
-  eval_W_prime: G::Scalar,
+  evals_batch: Vec<G::Scalar>,
   eval_arg: EE::EvaluationArgument,
 }
 
@@ -58,12 +164,31 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
   type ProverKey = ProverKey<G, EE>;
   type VerifierKey = VerifierKey<G, EE>;
 
-  fn setup(ck: &CommitmentKey<G>, S: &R1CSShape<G>) -> (Self::ProverKey, Self::VerifierKey) {
+  fn setup(
+    ck: &CommitmentKey<G>,
+    S: &R1CSShape<G>,
+  ) -> Result<(Self::ProverKey, Self::VerifierKey), NovaError> {
     let (pk_ee, vk_ee) = EE::setup(ck);
-    let pk = ProverKey { pk_ee, S: S.pad() };
-    let vk = VerifierKey { vk_ee, S: S.pad() };
 
-    (pk, vk)
+    let S = S.pad();
+
+    let vk = {
+      let mut vk = VerifierKey {
+        vk_ee,
+        S: S.clone(),
+        digest: G::Scalar::ZERO,
+      };
+      vk.digest = compute_digest::<G, VerifierKey<G, EE>>(&vk);
+      vk
+    };
+
+    let pk = ProverKey {
+      pk_ee,
+      S,
+      vk_digest: vk.digest,
+    };
+
+    Ok((pk, vk))
   }
 
   /// produces a succinct proof of satisfiability of a RelaxedR1CS instance
@@ -82,9 +207,9 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
     assert_eq!(pk.S.num_io.next_power_of_two(), pk.S.num_io);
     assert!(pk.S.num_io < pk.S.num_vars);
 
-    // append the R1CSShape and RelaxedR1CSInstance to the transcript
-    pk.S.append_to_transcript(b"S", &mut transcript);
-    U.append_to_transcript(b"U", &mut transcript);
+    // append the digest of vk (which includes R1CS matrices) and the RelaxedR1CSInstance to the transcript
+    transcript.absorb(b"vk", &pk.vk_digest);
+    transcript.absorb(b"U", U);
 
     // compute the full satisfying assignment by concatenating W.W, U.u, and U.X
     let mut z = concat(vec![W.W.clone(), vec![U.u], U.X.clone()]);
@@ -96,7 +221,7 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
 
     // outer sum-check
     let tau = (0..num_rounds_x)
-      .map(|_i| G::Scalar::challenge(b"tau", &mut transcript))
+      .map(|_i| transcript.squeeze(b"t"))
       .collect::<Result<Vec<G::Scalar>, NovaError>>()?;
 
     let mut poly_tau = MultilinearPolynomial::new(EqPolynomial::new(tau).evals());
@@ -120,7 +245,7 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
        poly_D_comp: &G::Scalar|
        -> G::Scalar { *poly_A_comp * (*poly_B_comp * *poly_C_comp - *poly_D_comp) };
     let (sc_proof_outer, r_x, claims_outer) = SumcheckProof::prove_cubic_with_additive_term(
-      &G::Scalar::zero(), // claim is zero
+      &G::Scalar::ZERO, // claim is zero
       num_rounds_x,
       &mut poly_tau,
       &mut poly_Az,
@@ -134,15 +259,13 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
     let (claim_Az, claim_Bz): (G::Scalar, G::Scalar) = (claims_outer[1], claims_outer[2]);
     let claim_Cz = poly_Cz.evaluate(&r_x);
     let eval_E = MultilinearPolynomial::new(W.E.clone()).evaluate(&r_x);
-
-    <[G::Scalar] as AppendToTranscriptTrait<G>>::append_to_transcript(
-      &[claim_Az, claim_Bz, claim_Cz, eval_E],
+    transcript.absorb(
       b"claims_outer",
-      &mut transcript,
+      &[claim_Az, claim_Bz, claim_Cz, eval_E].as_slice(),
     );
 
     // inner sum-check
-    let r = G::Scalar::challenge(b"r", &mut transcript)?;
+    let r = transcript.squeeze(b"r")?;
     let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
 
     let poly_ABC = {
@@ -162,19 +285,19 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
 
           let (A_evals, (B_evals, C_evals)) = rayon::join(
             || {
-              let mut A_evals: Vec<G::Scalar> = vec![G::Scalar::zero(); 2 * S.num_vars];
+              let mut A_evals: Vec<G::Scalar> = vec![G::Scalar::ZERO; 2 * S.num_vars];
               inner(&S.A, &mut A_evals);
               A_evals
             },
             || {
               rayon::join(
                 || {
-                  let mut B_evals: Vec<G::Scalar> = vec![G::Scalar::zero(); 2 * S.num_vars];
+                  let mut B_evals: Vec<G::Scalar> = vec![G::Scalar::ZERO; 2 * S.num_vars];
                   inner(&S.B, &mut B_evals);
                   B_evals
                 },
                 || {
-                  let mut C_evals: Vec<G::Scalar> = vec![G::Scalar::zero(); 2 * S.num_vars];
+                  let mut C_evals: Vec<G::Scalar> = vec![G::Scalar::ZERO; 2 * S.num_vars];
                   inner(&S.C, &mut C_evals);
                   C_evals
                 },
@@ -196,7 +319,7 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
     };
 
     let poly_z = {
-      z.resize(pk.S.num_vars * 2, G::Scalar::zero());
+      z.resize(pk.S.num_vars * 2, G::Scalar::ZERO);
       z
     };
 
@@ -212,60 +335,102 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
       &mut transcript,
     )?;
 
-    let eval_W = MultilinearPolynomial::new(W.W.clone()).evaluate(&r_y[1..]);
-    <G::Scalar as AppendToTranscriptTrait<G>>::append_to_transcript(
-      &eval_W,
-      b"eval_W",
-      &mut transcript,
-    );
+    // add additional claims about W and E polynomials to the list from CC
+    let mut w_u_vec = Vec::new();
+    let eval_W = MultilinearPolynomial::evaluate_with(&W.W, &r_y[1..]);
+    w_u_vec.push((
+      PolyEvalWitness { p: W.W.clone() },
+      PolyEvalInstance {
+        c: U.comm_W,
+        x: r_y[1..].to_vec(),
+        e: eval_W,
+      },
+    ));
 
-    // We will now reduce eval_W =? W(r_y[1..]) and eval_W =? E(r_x) into
+    w_u_vec.push((
+      PolyEvalWitness { p: W.E },
+      PolyEvalInstance {
+        c: U.comm_E,
+        x: r_x,
+        e: eval_E,
+      },
+    ));
+
+    // We will now reduce a vector of claims of evaluations at different points into claims about them at the same point.
+    // For example, eval_W =? W(r_y[1..]) and eval_W =? E(r_x) into
     // two claims: eval_W_prime =? W(rz) and eval_E_prime =? E(rz)
     // We can them combine the two into one: eval_W_prime + gamma * eval_E_prime =? (W + gamma*E)(rz),
     // where gamma is a public challenge
     // Since commitments to W and E are homomorphic, the verifier can compute a commitment
     // to the batched polynomial.
-    let rho = G::Scalar::challenge(b"rho", &mut transcript)?;
+    assert!(w_u_vec.len() >= 2);
 
-    let claim_batch_joint = eval_E + rho * eval_W;
-    let num_rounds_z = num_rounds_x;
-    let comb_func =
-      |poly_A_comp: &G::Scalar,
-       poly_B_comp: &G::Scalar,
-       poly_C_comp: &G::Scalar,
-       poly_D_comp: &G::Scalar|
-       -> G::Scalar { *poly_A_comp * *poly_B_comp + rho * *poly_C_comp * *poly_D_comp };
-    let (sc_proof_batch, r_z, claims_batch) = SumcheckProof::prove_quad_sum(
+    let (w_vec, u_vec): (Vec<PolyEvalWitness<G>>, Vec<PolyEvalInstance<G>>) =
+      w_u_vec.into_iter().unzip();
+    let w_vec_padded = PolyEvalWitness::pad(&w_vec); // pad the polynomials to be of the same size
+    let u_vec_padded = PolyEvalInstance::pad(&u_vec); // pad the evaluation points
+
+    // generate a challenge
+    let rho = transcript.squeeze(b"r")?;
+    let num_claims = w_vec_padded.len();
+    let powers_of_rho = powers::<G>(&rho, num_claims);
+    let claim_batch_joint = u_vec_padded
+      .iter()
+      .zip(powers_of_rho.iter())
+      .map(|(u, p)| u.e * p)
+      .fold(G::Scalar::ZERO, |acc, item| acc + item);
+
+    let mut polys_left: Vec<MultilinearPolynomial<G::Scalar>> = w_vec_padded
+      .iter()
+      .map(|w| MultilinearPolynomial::new(w.p.clone()))
+      .collect();
+    let mut polys_right: Vec<MultilinearPolynomial<G::Scalar>> = u_vec_padded
+      .iter()
+      .map(|u| MultilinearPolynomial::new(EqPolynomial::new(u.x.clone()).evals()))
+      .collect();
+
+    let num_rounds_z = u_vec_padded[0].x.len();
+    let comb_func = |poly_A_comp: &G::Scalar, poly_B_comp: &G::Scalar| -> G::Scalar {
+      *poly_A_comp * *poly_B_comp
+    };
+    let (sc_proof_batch, r_z, claims_batch) = SumcheckProof::prove_quad_batch(
       &claim_batch_joint,
       num_rounds_z,
-      &mut MultilinearPolynomial::new(EqPolynomial::new(r_x).evals()),
-      &mut MultilinearPolynomial::new(W.E.clone()),
-      &mut MultilinearPolynomial::new(EqPolynomial::new(r_y[1..].to_vec()).evals()),
-      &mut MultilinearPolynomial::new(W.W.clone()),
+      &mut polys_left,
+      &mut polys_right,
+      &powers_of_rho,
       comb_func,
       &mut transcript,
     )?;
 
-    let eval_E_prime = claims_batch[1];
-    let eval_W_prime = claims_batch[3];
-    <[G::Scalar] as AppendToTranscriptTrait<G>>::append_to_transcript(
-      &[eval_E_prime, eval_W_prime],
-      b"claims_batch",
-      &mut transcript,
-    );
+    let (claims_batch_left, _): (Vec<G::Scalar>, Vec<G::Scalar>) = claims_batch;
+
+    transcript.absorb(b"l", &claims_batch_left.as_slice());
 
     // we now combine evaluation claims at the same point rz into one
-    let gamma = G::Scalar::challenge(b"gamma", &mut transcript)?;
-    let comm = U.comm_E + U.comm_W * gamma;
-    let poly = W
-      .E
+    let gamma = transcript.squeeze(b"g")?;
+    let powers_of_gamma: Vec<G::Scalar> = powers::<G>(&gamma, num_claims);
+    let comm_joint = u_vec_padded
       .iter()
-      .zip(W.W.iter())
-      .map(|(e, w)| *e + gamma * w)
-      .collect::<Vec<G::Scalar>>();
-    let eval = eval_E_prime + gamma * eval_W_prime;
+      .zip(powers_of_gamma.iter())
+      .map(|(u, g_i)| u.c * *g_i)
+      .fold(Commitment::<G>::default(), |acc, item| acc + item);
+    let poly_joint = PolyEvalWitness::weighted_sum(&w_vec_padded, &powers_of_gamma);
+    let eval_joint = claims_batch_left
+      .iter()
+      .zip(powers_of_gamma.iter())
+      .map(|(e, g_i)| *e * *g_i)
+      .fold(G::Scalar::ZERO, |acc, item| acc + item);
 
-    let eval_arg = EE::prove(ck, &pk.pk_ee, &mut transcript, &comm, &poly, &r_z, &eval)?;
+    let eval_arg = EE::prove(
+      ck,
+      &pk.pk_ee,
+      &mut transcript,
+      &comm_joint,
+      &poly_joint.p,
+      &r_z,
+      &eval_joint,
+    )?;
 
     Ok(RelaxedR1CSSNARK {
       sc_proof_outer,
@@ -274,8 +439,7 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
       sc_proof_inner,
       eval_W,
       sc_proof_batch,
-      eval_E_prime,
-      eval_W_prime,
+      evals_batch: claims_batch_left,
       eval_arg,
     })
   }
@@ -284,9 +448,9 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
   fn verify(&self, vk: &Self::VerifierKey, U: &RelaxedR1CSInstance<G>) -> Result<(), NovaError> {
     let mut transcript = G::TE::new(b"RelaxedR1CSSNARK");
 
-    // append the R1CSShape and RelaxedR1CSInstance to the transcript
-    vk.S.append_to_transcript(b"S", &mut transcript);
-    U.append_to_transcript(b"U", &mut transcript);
+    // append the digest of R1CS matrices and the RelaxedR1CSInstance to the transcript
+    transcript.absorb(b"vk", &vk.digest);
+    transcript.absorb(b"U", U);
 
     let (num_rounds_x, num_rounds_y) = (
       (vk.S.num_cons as f64).log2() as usize,
@@ -295,13 +459,13 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
 
     // outer sum-check
     let tau = (0..num_rounds_x)
-      .map(|_i| G::Scalar::challenge(b"tau", &mut transcript))
+      .map(|_i| transcript.squeeze(b"t"))
       .collect::<Result<Vec<G::Scalar>, NovaError>>()?;
 
     let (claim_outer_final, r_x) =
       self
         .sc_proof_outer
-        .verify(G::Scalar::zero(), num_rounds_x, 3, &mut transcript)?;
+        .verify(G::Scalar::ZERO, num_rounds_x, 3, &mut transcript)?;
 
     // verify claim_outer_final
     let (claim_Az, claim_Bz, claim_Cz) = self.claims_outer;
@@ -312,19 +476,19 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
       return Err(NovaError::InvalidSumcheckProof);
     }
 
-    <[G::Scalar] as AppendToTranscriptTrait<G>>::append_to_transcript(
+    transcript.absorb(
+      b"claims_outer",
       &[
         self.claims_outer.0,
         self.claims_outer.1,
         self.claims_outer.2,
         self.eval_E,
-      ],
-      b"claims_outer",
-      &mut transcript,
+      ]
+      .as_slice(),
     );
 
     // inner sum-check
-    let r = G::Scalar::challenge(b"r", &mut transcript)?;
+    let r = transcript.squeeze(b"r")?;
     let claim_inner_joint =
       self.claims_outer.0 + r * self.claims_outer.1 + r * r * self.claims_outer.2;
 
@@ -346,13 +510,14 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
         );
         SparsePolynomial::new((vk.S.num_vars as f64).log2() as usize, poly_X).evaluate(&r_y[1..])
       };
-      (G::Scalar::one() - r_y[0]) * self.eval_W + r_y[0] * eval_X
+      (G::Scalar::ONE - r_y[0]) * self.eval_W + r_y[0] * eval_X
     };
 
-    let evaluate_as_sparse_polynomial = |S: &R1CSShape<G>,
-                                         r_x: &[G::Scalar],
-                                         r_y: &[G::Scalar]|
-     -> (G::Scalar, G::Scalar, G::Scalar) {
+    // compute evaluations of R1CS matrices
+    let multi_evaluate = |M_vec: &[&[(usize, usize, G::Scalar)]],
+                          r_x: &[G::Scalar],
+                          r_y: &[G::Scalar]|
+     -> Vec<G::Scalar> {
       let evaluate_with_table =
         |M: &[(usize, usize, G::Scalar)], T_x: &[G::Scalar], T_y: &[G::Scalar]| -> G::Scalar {
           (0..M.len())
@@ -362,33 +527,55 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
               let (row, col, val) = M[i];
               T_x[row] * T_y[col] * val
             })
-            .reduce(G::Scalar::zero, |acc, x| acc + x)
+            .reduce(|| G::Scalar::ZERO, |acc, x| acc + x)
         };
 
-      let T_x = EqPolynomial::new(r_x.to_vec()).evals();
-      let T_y = EqPolynomial::new(r_y.to_vec()).evals();
-      let eval_A_r = evaluate_with_table(&S.A, &T_x, &T_y);
-      let eval_B_r = evaluate_with_table(&S.B, &T_x, &T_y);
-      let eval_C_r = evaluate_with_table(&S.C, &T_x, &T_y);
-      (eval_A_r, eval_B_r, eval_C_r)
+      let (T_x, T_y) = rayon::join(
+        || EqPolynomial::new(r_x.to_vec()).evals(),
+        || EqPolynomial::new(r_y.to_vec()).evals(),
+      );
+
+      (0..M_vec.len())
+        .collect::<Vec<usize>>()
+        .par_iter()
+        .map(|&i| evaluate_with_table(M_vec[i], &T_x, &T_y))
+        .collect()
     };
 
-    let (eval_A_r, eval_B_r, eval_C_r) = evaluate_as_sparse_polynomial(&vk.S, &r_x, &r_y);
-    let claim_inner_final_expected = (eval_A_r + r * eval_B_r + r * r * eval_C_r) * eval_Z;
+    let evals = multi_evaluate(&[&vk.S.A, &vk.S.B, &vk.S.C], &r_x, &r_y);
+
+    let claim_inner_final_expected = (evals[0] + r * evals[1] + r * r * evals[2]) * eval_Z;
     if claim_inner_final != claim_inner_final_expected {
       return Err(NovaError::InvalidSumcheckProof);
     }
 
-    // batch sum-check
-    <G::Scalar as AppendToTranscriptTrait<G>>::append_to_transcript(
-      &self.eval_W,
-      b"eval_W",
-      &mut transcript,
-    );
+    // add claims about W and E polynomials
+    let u_vec: Vec<PolyEvalInstance<G>> = vec![
+      PolyEvalInstance {
+        c: U.comm_W,
+        x: r_y[1..].to_vec(),
+        e: self.eval_W,
+      },
+      PolyEvalInstance {
+        c: U.comm_E,
+        x: r_x,
+        e: self.eval_E,
+      },
+    ];
 
-    let rho = G::Scalar::challenge(b"rho", &mut transcript)?;
-    let claim_batch_joint = self.eval_E + rho * self.eval_W;
-    let num_rounds_z = num_rounds_x;
+    let u_vec_padded = PolyEvalInstance::pad(&u_vec); // pad the evaluation points
+
+    // generate a challenge
+    let rho = transcript.squeeze(b"r")?;
+    let num_claims = u_vec.len();
+    let powers_of_rho = powers::<G>(&rho, num_claims);
+    let claim_batch_joint = u_vec
+      .iter()
+      .zip(powers_of_rho.iter())
+      .map(|(u, p)| u.e * p)
+      .fold(G::Scalar::ZERO, |acc, item| acc + item);
+
+    let num_rounds_z = u_vec_padded[0].x.len();
     let (claim_batch_final, r_z) =
       self
         .sc_proof_batch
@@ -396,33 +583,47 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
 
     let claim_batch_final_expected = {
       let poly_rz = EqPolynomial::new(r_z.clone());
-      let rz_rx = poly_rz.evaluate(&r_x);
-      let rz_ry = poly_rz.evaluate(&r_y[1..]);
-      rz_rx * self.eval_E_prime + rho * rz_ry * self.eval_W_prime
+      let evals = u_vec_padded
+        .iter()
+        .map(|u| poly_rz.evaluate(&u.x))
+        .collect::<Vec<G::Scalar>>();
+
+      evals
+        .iter()
+        .zip(self.evals_batch.iter())
+        .zip(powers_of_rho.iter())
+        .map(|((e_i, p_i), rho_i)| *e_i * *p_i * rho_i)
+        .fold(G::Scalar::ZERO, |acc, item| acc + item)
     };
 
     if claim_batch_final != claim_batch_final_expected {
       return Err(NovaError::InvalidSumcheckProof);
     }
 
-    <[G::Scalar] as AppendToTranscriptTrait<G>>::append_to_transcript(
-      &[self.eval_E_prime, self.eval_W_prime],
-      b"claims_batch",
-      &mut transcript,
-    );
+    transcript.absorb(b"l", &self.evals_batch.as_slice());
 
     // we now combine evaluation claims at the same point rz into one
-    let gamma = G::Scalar::challenge(b"gamma", &mut transcript)?;
-    let comm = U.comm_E + U.comm_W * gamma;
-    let eval = self.eval_E_prime + gamma * self.eval_W_prime;
+    let gamma = transcript.squeeze(b"g")?;
+    let powers_of_gamma: Vec<G::Scalar> = powers::<G>(&gamma, num_claims);
+    let comm_joint = u_vec_padded
+      .iter()
+      .zip(powers_of_gamma.iter())
+      .map(|(u, g_i)| u.c * *g_i)
+      .fold(Commitment::<G>::default(), |acc, item| acc + item);
+    let eval_joint = self
+      .evals_batch
+      .iter()
+      .zip(powers_of_gamma.iter())
+      .map(|(e, g_i)| *e * *g_i)
+      .fold(G::Scalar::ZERO, |acc, item| acc + item);
 
-    // verify eval_W and eval_E
+    // verify
     EE::verify(
       &vk.vk_ee,
       &mut transcript,
-      &comm,
+      &comm_joint,
       &r_z,
-      &eval,
+      &eval_joint,
       &self.eval_arg,
     )?;
 

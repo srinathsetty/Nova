@@ -8,10 +8,13 @@ pub mod solver;
 
 #[cfg(test)]
 mod tests {
-  use crate::bellperson::{
-    r1cs::{NovaShape, NovaWitness},
-    shape_cs::ShapeCS,
-    solver::SatisfyingAssignment,
+  use crate::{
+    bellperson::{
+      r1cs::{NovaShape, NovaWitness},
+      shape_cs::ShapeCS,
+      solver::SatisfyingAssignment,
+    },
+    traits::Group,
   };
   use bellperson::{gadgets::num::AllocatedNum, ConstraintSystem, SynthesisError};
   use ff::PrimeField;
@@ -20,7 +23,7 @@ mod tests {
     cs: &mut CS,
   ) -> Result<(), SynthesisError> {
     // get two bits as input and check that they are indeed bits
-    let a = AllocatedNum::alloc(cs.namespace(|| "a"), || Ok(Fr::one()))?;
+    let a = AllocatedNum::alloc(cs.namespace(|| "a"), || Ok(Fr::ONE))?;
     let _ = a.inputize(cs.namespace(|| "a is input"));
     cs.enforce(
       || "check a is 0 or 1",
@@ -28,7 +31,7 @@ mod tests {
       |lc| lc + a.get_variable(),
       |lc| lc,
     );
-    let b = AllocatedNum::alloc(cs.namespace(|| "b"), || Ok(Fr::one()))?;
+    let b = AllocatedNum::alloc(cs.namespace(|| "b"), || Ok(Fr::ONE))?;
     let _ = b.inputize(cs.namespace(|| "b is input"));
     cs.enforce(
       || "check b is 0 or 1",
@@ -39,15 +42,14 @@ mod tests {
     Ok(())
   }
 
-  #[test]
-  fn test_alloc_bit() {
-    type G = pasta_curves::pallas::Point;
-
+  fn test_alloc_bit_with<G>()
+  where
+    G: Group,
+  {
     // First create the shape
     let mut cs: ShapeCS<G> = ShapeCS::new();
     let _ = synthesize_alloc_bit(&mut cs);
-    let shape = cs.r1cs_shape();
-    let ck = cs.commitment_key();
+    let (shape, ck) = cs.r1cs_shape();
 
     // Now get the assignment
     let mut cs: SatisfyingAssignment<G> = SatisfyingAssignment::new();
@@ -56,5 +58,11 @@ mod tests {
 
     // Make sure that this is satisfiable
     assert!(shape.is_sat(&ck, &inst, &witness).is_ok());
+  }
+
+  #[test]
+  fn test_alloc_bit() {
+    type G = pasta_curves::pallas::Point;
+    test_alloc_bit_with::<G>();
   }
 }

@@ -5,9 +5,9 @@ use crate::{
   provider::pedersen::CommitmentKeyExtTrait,
   spartan::polynomial::EqPolynomial,
   traits::{
-    commitment::{CommitmentEngineTrait, CommitmentKeyTrait, CommitmentTrait},
+    commitment::{CommitmentEngineTrait, CommitmentTrait},
     evaluation::EvaluationEngineTrait,
-    AppendToTranscriptTrait, ChallengeTrait, Group, TranscriptEngineTrait,
+    Group, TranscriptEngineTrait, TranscriptReprTrait,
   },
   Commitment, CommitmentKey, CompressedCommitment, CE,
 };
@@ -59,12 +59,12 @@ where
     ck: &<Self::CE as CommitmentEngineTrait<G>>::CommitmentKey,
   ) -> (Self::ProverKey, Self::VerifierKey) {
     let pk = ProverKey {
-      ck_s: CommitmentKey::<G>::new(b"ipa", 1),
+      ck_s: G::CE::setup(b"ipa", 1),
     };
 
     let vk = VerifierKey {
       ck_v: ck.clone(),
-      ck_s: CommitmentKey::<G>::new(b"ipa", 1),
+      ck_s: G::CE::setup(b"ipa", 1),
     };
 
     (pk, vk)
@@ -118,7 +118,7 @@ where
   (0..a.len())
     .into_par_iter()
     .map(|i| a[i] * b[i])
-    .reduce(T::zero, |x, y| x + y)
+    .reduce(|| T::ZERO, |x, y| x + y)
 }
 
 /// An inner product instance consists of a commitment to a vector `a` and another vector `b`
@@ -136,6 +136,17 @@ impl<G: Group> InnerProductInstance<G> {
       b_vec: b_vec.to_vec(),
       c: *c,
     }
+  }
+}
+
+impl<G: Group> TranscriptReprTrait<G> for InnerProductInstance<G> {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    // we do not need to include self.b_vec as in our context it is produced from the transcript
+    [
+      self.comm_a_vec.to_transcript_bytes(),
+      self.c.to_transcript_bytes(),
+    ]
+    .concat()
   }
 }
 
@@ -167,7 +178,7 @@ where
   CommitmentKey<G>: CommitmentKeyExtTrait<G, CE = G::CE>,
 {
   fn protocol_name() -> &'static [u8] {
-    b"inner product argument"
+    b"IPA"
   }
 
   fn prove(
@@ -177,17 +188,19 @@ where
     W: &InnerProductWitness<G>,
     transcript: &mut G::TE,
   ) -> Result<Self, NovaError> {
-    transcript.absorb_bytes(b"protocol-name", Self::protocol_name());
+    transcript.dom_sep(Self::protocol_name());
+
+    let (ck, _) = ck.split_at(U.b_vec.len());
 
     if U.b_vec.len() != W.a_vec.len() {
       return Err(NovaError::InvalidInputLength);
     }
 
-    U.comm_a_vec.append_to_transcript(b"comm_a_vec", transcript);
-    <G::Scalar as AppendToTranscriptTrait<G>>::append_to_transcript(&U.c, b"c", transcript);
+    // absorb the instance in the transcript
+    transcript.absorb(b"U", U);
 
     // sample a random base for commiting to the inner product
-    let r = G::Scalar::challenge(b"r", transcript)?;
+    let r = transcript.squeeze(b"r")?;
     let ck_c = ck_c.scale(&r);
 
     // a closure that executes a step of the recursive inner product argument
@@ -230,10 +243,10 @@ where
       )
       .compress();
 
-      L.append_to_transcript(b"L", transcript);
-      R.append_to_transcript(b"R", transcript);
+      transcript.absorb(b"L", &L);
+      transcript.absorb(b"R", &R);
 
-      let r = G::Scalar::challenge(b"challenge_r", transcript)?;
+      let r = transcript.squeeze(b"r")?;
       let r_inverse = r.invert().unwrap();
 
       // fold the left half and the right half
@@ -261,7 +274,7 @@ where
     // we create mutable copies of vectors and generators
     let mut a_vec = W.a_vec.to_vec();
     let mut b_vec = U.b_vec.to_vec();
-    let mut ck = ck.clone();
+    let mut ck = ck;
     for _i in 0..(U.b_vec.len() as f64).log2() as usize {
       let (L, R, a_vec_folded, b_vec_folded, ck_folded) =
         prove_inner(&a_vec, &b_vec, &ck, transcript)?;
@@ -289,7 +302,9 @@ where
     U: &InnerProductInstance<G>,
     transcript: &mut G::TE,
   ) -> Result<(), NovaError> {
-    transcript.absorb_bytes(b"protocol-name", Self::protocol_name());
+    let (ck, _) = ck.split_at(U.b_vec.len());
+
+    transcript.dom_sep(Self::protocol_name());
     if U.b_vec.len() != n
       || n != (1 << self.L_vec.len())
       || self.L_vec.len() != self.R_vec.len()
@@ -298,18 +313,18 @@ where
       return Err(NovaError::InvalidInputLength);
     }
 
-    U.comm_a_vec.append_to_transcript(b"comm_a_vec", transcript);
-    <G::Scalar as AppendToTranscriptTrait<G>>::append_to_transcript(&U.c, b"c", transcript);
+    // absorb the instance in the transcript
+    transcript.absorb(b"U", U);
 
     // sample a random base for commiting to the inner product
-    let r = G::Scalar::challenge(b"r", transcript)?;
+    let r = transcript.squeeze(b"r")?;
     let ck_c = ck_c.scale(&r);
 
     let P = U.comm_a_vec + CE::<G>::commit(&ck_c, &[U.c]);
 
     let batch_invert = |v: &[G::Scalar]| -> Result<Vec<G::Scalar>, NovaError> {
-      let mut products = vec![G::Scalar::zero(); v.len()];
-      let mut acc = G::Scalar::one();
+      let mut products = vec![G::Scalar::ZERO; v.len()];
+      let mut acc = G::Scalar::ONE;
 
       for i in 0..v.len() {
         products[i] = acc;
@@ -317,14 +332,14 @@ where
       }
 
       // we can compute an inversion only if acc is non-zero
-      if acc == G::Scalar::zero() {
+      if acc == G::Scalar::ZERO {
         return Err(NovaError::InvalidInputLength);
       }
 
       // compute the inverse once for all entries
       acc = acc.invert().unwrap();
 
-      let mut inv = vec![G::Scalar::zero(); v.len()];
+      let mut inv = vec![G::Scalar::ZERO; v.len()];
       for i in 0..v.len() {
         let tmp = acc * v[v.len() - 1 - i];
         inv[v.len() - 1 - i] = products[v.len() - 1 - i] * acc;
@@ -337,9 +352,9 @@ where
     // compute a vector of public coins using self.L_vec and self.R_vec
     let r = (0..self.L_vec.len())
       .map(|i| {
-        self.L_vec[i].append_to_transcript(b"L", transcript);
-        self.R_vec[i].append_to_transcript(b"R", transcript);
-        G::Scalar::challenge(b"challenge_r", transcript)
+        transcript.absorb(b"L", &self.L_vec[i]);
+        transcript.absorb(b"R", &self.R_vec[i]);
+        transcript.squeeze(b"r")
       })
       .collect::<Result<Vec<G::Scalar>, NovaError>>()?;
 
@@ -356,9 +371,9 @@ where
 
     // compute the vector with the tensor structure
     let s = {
-      let mut s = vec![G::Scalar::zero(); n];
+      let mut s = vec![G::Scalar::ZERO; n];
       s[0] = {
-        let mut v = G::Scalar::one();
+        let mut v = G::Scalar::ONE;
         for r_inverse_i in &r_inverse {
           v *= r_inverse_i;
         }
@@ -372,7 +387,7 @@ where
     };
 
     let ck_hat = {
-      let c = CE::<G>::commit(ck, &s).compress();
+      let c = CE::<G>::commit(&ck, &s).compress();
       CommitmentKey::<G>::reinterpret_commitments_as_ck(&[c])?
     };
 
@@ -391,7 +406,7 @@ where
         &r_square
           .iter()
           .chain(r_inverse_square.iter())
-          .chain(iter::once(&G::Scalar::one()))
+          .chain(iter::once(&G::Scalar::ONE))
           .copied()
           .collect::<Vec<G::Scalar>>(),
       )

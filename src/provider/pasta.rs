@@ -1,20 +1,19 @@
 //! This module implements the Nova traits for pallas::Point, pallas::Scalar, vesta::Point, vesta::Scalar.
 use crate::{
-  errors::NovaError,
   provider::{
     keccak::Keccak256Transcript,
     pedersen::CommitmentEngine,
     poseidon::{PoseidonRO, PoseidonROCircuit},
   },
-  traits::{ChallengeTrait, CompressedGroup, Group, PrimeFieldExt, TranscriptEngineTrait},
+  traits::{CompressedGroup, Group, PrimeFieldExt, TranscriptReprTrait},
 };
 use digest::{ExtendableOutput, Input};
-use ff::PrimeField;
+use ff::{FromUniformBytes, PrimeField};
 use num_bigint::BigInt;
 use num_traits::Num;
 use pasta_curves::{
   self,
-  arithmetic::{CurveAffine, CurveExt, FieldExt, Group as OtherGroup},
+  arithmetic::{CurveAffine, CurveExt},
   group::{cofactor::CofactorCurveAffine, Curve, Group as AnotherGroup, GroupEncoding},
   pallas, vesta, Ep, EpAffine, Eq, EqAffine,
 };
@@ -156,15 +155,15 @@ macro_rules! impl_traits {
       }
 
       fn get_curve_params() -> (Self::Base, Self::Base, BigInt) {
-        let A = Self::Base::zero();
-        let B = Self::Base::from(5);
+        let A = $name::Point::a();
+        let B = $name::Point::b();
         let order = BigInt::from_str_radix($order_str, 16).unwrap();
 
         (A, B, order)
       }
 
       fn zero() -> Self {
-        $name::Point::group_zero()
+        $name::Point::identity()
       }
 
       fn get_generator() -> Self {
@@ -175,11 +174,13 @@ macro_rules! impl_traits {
     impl PrimeFieldExt for $name::Scalar {
       fn from_uniform(bytes: &[u8]) -> Self {
         let bytes_arr: [u8; 64] = bytes.try_into().unwrap();
-        $name::Scalar::from_bytes_wide(&bytes_arr)
+        $name::Scalar::from_uniform_bytes(&bytes_arr)
       }
+    }
 
-      fn to_bytes(&self) -> Vec<u8> {
-        self.to_repr().as_ref().to_vec()
+    impl<G: Group> TranscriptReprTrait<G> for $name_compressed {
+      fn to_transcript_bytes(&self) -> Vec<u8> {
+        self.repr.to_vec()
       }
     }
 
@@ -189,17 +190,19 @@ macro_rules! impl_traits {
       fn decompress(&self) -> Option<$name::Point> {
         Some($name_curve::from_bytes(&self.repr).unwrap())
       }
-
-      fn as_bytes(&self) -> Vec<u8> {
-        self.repr.to_vec()
-      }
     }
   };
 }
 
-impl<G: Group<Scalar = F>, F: PrimeField> ChallengeTrait<G> for F {
-  fn challenge(label: &'static [u8], transcript: &mut G::TE) -> Result<F, NovaError> {
-    transcript.squeeze_scalar(label)
+impl<G: Group> TranscriptReprTrait<G> for pallas::Base {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    self.to_repr().to_vec()
+  }
+}
+
+impl<G: Group> TranscriptReprTrait<G> for pallas::Scalar {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    self.to_repr().to_vec()
   }
 }
 

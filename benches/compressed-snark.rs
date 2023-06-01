@@ -50,7 +50,7 @@ fn bench_compressed_snark(c: &mut Criterion) {
     );
 
     // Produce prover and verifier keys for CompressedSNARK
-    let (pk, vk) = CompressedSNARK::<_, _, _, _, S1, S2>::setup(&pp);
+    let (pk, vk) = CompressedSNARK::<_, _, _, _, S1, S2>::setup(&pp).unwrap();
 
     // produce a recursive SNARK
     let num_steps = 3;

@@ -43,16 +43,16 @@ where
     CS: ConstraintSystem<G::Base>,
   {
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      Ok(coords.map_or(G::Base::zero(), |c| c.0))
+      Ok(coords.map_or(G::Base::ZERO, |c| c.0))
     })?;
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      Ok(coords.map_or(G::Base::zero(), |c| c.1))
+      Ok(coords.map_or(G::Base::ZERO, |c| c.1))
     })?;
     let is_infinity = AllocatedNum::alloc(cs.namespace(|| "is_infinity"), || {
       Ok(if coords.map_or(true, |c| c.2) {
-        G::Base::one()
+        G::Base::ONE
       } else {
-        G::Base::zero()
+        G::Base::ZERO
       })
     })?;
     cs.enforce(
@@ -177,9 +177,9 @@ where
     // NOT(NOT(self.is_ifninity) AND NOT(other.is_infinity))
     let at_least_one_inf = AllocatedNum::alloc(cs.namespace(|| "at least one inf"), || {
       Ok(
-        G::Base::one()
-          - (G::Base::one() - *self.is_infinity.get_value().get()?)
-            * (G::Base::one() - *other.is_infinity.get_value().get()?),
+        G::Base::ONE
+          - (G::Base::ONE - *self.is_infinity.get_value().get()?)
+            * (G::Base::ONE - *other.is_infinity.get_value().get()?),
       )
     })?;
     cs.enforce(
@@ -193,7 +193,7 @@ where
     let x_diff_is_actual =
       AllocatedNum::alloc(cs.namespace(|| "allocate x_diff_is_actual"), || {
         Ok(if *equal_x.get_value().get()? {
-          G::Base::one()
+          G::Base::ONE
         } else {
           *at_least_one_inf.get_value().get()?
         })
@@ -215,9 +215,9 @@ where
     )?;
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let x_diff_inv = if *x_diff_is_actual.get_value().get()? == G::Base::one() {
+      let x_diff_inv = if *x_diff_is_actual.get_value().get()? == G::Base::ONE {
         // Set to default
-        G::Base::one()
+        G::Base::ONE
       } else {
         // Set to the actual inverse
         (*other.x.get_value().get()? - *self.x.get_value().get()?)
@@ -328,7 +328,7 @@ where
     //  * (G::Base::from(2)) * self.y).invert().unwrap();
     /*************************************************************/
 
-    // Compute tmp = (G::Base::one() + G::Base::one())* self.y ? self != inf : 1
+    // Compute tmp = (G::Base::ONE + G::Base::ONE)* self.y ? self != inf : 1
     let tmp_actual = AllocatedNum::alloc(cs.namespace(|| "tmp_actual"), || {
       Ok(*self.y.get_value().get()? + *self.y.get_value().get()?)
     })?;
@@ -354,9 +354,9 @@ where
     );
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "alloc lambda"), || {
-      let tmp_inv = if *self.is_infinity.get_value().get()? == G::Base::one() {
+      let tmp_inv = if *self.is_infinity.get_value().get()? == G::Base::ONE {
         // Return default value 1
-        G::Base::one()
+        G::Base::ONE
       } else {
         // Return the actual inverse
         (*tmp.get_value().get()?).invert().unwrap()
@@ -622,7 +622,7 @@ where
     // allocate a free variable that an honest prover sets to lambda = (y2-y1)/(x2-x1)
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
       if *other.x.get_value().get()? == *self.x.get_value().get()? {
-        Ok(G::Base::one())
+        Ok(G::Base::ONE)
       } else {
         Ok(
           (*other.y.get_value().get()? - *self.y.get_value().get()?)
@@ -688,8 +688,8 @@ where
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
       let n = G::Base::from(3) * x_sq.get_value().get()? + G::get_curve_params().0;
       let d = G::Base::from(2) * *self.y.get_value().get()?;
-      if d == G::Base::zero() {
-        Ok(G::Base::one())
+      if d == G::Base::ZERO {
+        Ok(G::Base::ONE)
       } else {
         Ok(n * d.invert().unwrap())
       }
@@ -755,11 +755,8 @@ mod tests {
     {shape_cs::ShapeCS, solver::SatisfyingAssignment},
   };
   use ff::{Field, PrimeFieldBits};
-  use pasta_curves::{arithmetic::CurveAffine, group::Curve, EpAffine};
+  use pasta_curves::{arithmetic::CurveAffine, group::Curve, pallas, vesta};
   use rand::rngs::OsRng;
-  use std::ops::Mul;
-  type G1 = pasta_curves::pallas::Point;
-  type G2 = pasta_curves::vesta::Point;
 
   #[derive(Debug, Clone)]
   pub struct Point<G>
@@ -783,7 +780,7 @@ mod tests {
     pub fn random_vartime() -> Self {
       loop {
         let x = G::Base::random(&mut OsRng);
-        let y = (x * x * x + G::Base::from(5)).sqrt();
+        let y = (x.square() * x + G::get_curve_params().1).sqrt();
         if y.is_some().unwrap_u8() == 1 {
           return Self {
             x,
@@ -803,8 +800,8 @@ mod tests {
         } else {
           // if self.x == other.x and self.y != other.y then return infinity
           Self {
-            x: G::Base::zero(),
-            y: G::Base::zero(),
+            x: G::Base::ZERO,
+            y: G::Base::ZERO,
             is_infinity: true,
           }
         }
@@ -836,8 +833,8 @@ mod tests {
     pub fn double(&self) -> Self {
       if self.is_infinity {
         return Self {
-          x: G::Base::zero(),
-          y: G::Base::zero(),
+          x: G::Base::ZERO,
+          y: G::Base::ZERO,
           is_infinity: true,
         };
       }
@@ -845,9 +842,7 @@ mod tests {
       let lambda = G::Base::from(3)
         * self.x
         * self.x
-        * ((G::Base::one() + G::Base::one()) * self.y)
-          .invert()
-          .unwrap();
+        * ((G::Base::ONE + G::Base::ONE) * self.y).invert().unwrap();
       let x = lambda * lambda - self.x - self.x;
       let y = lambda * (self.x - x) - self.y;
       Self {
@@ -859,8 +854,8 @@ mod tests {
 
     pub fn scalar_mul(&self, scalar: &G::Scalar) -> Self {
       let mut res = Self {
-        x: G::Base::zero(),
-        y: G::Base::zero(),
+        x: G::Base::ZERO,
+        y: G::Base::ZERO,
         is_infinity: true,
       };
 
@@ -899,52 +894,61 @@ mod tests {
 
   #[test]
   fn test_ecc_ops() {
+    test_ecc_ops_with::<pallas::Affine, pallas::Point>();
+    test_ecc_ops_with::<vesta::Affine, vesta::Point>();
+  }
+
+  fn test_ecc_ops_with<C, G>()
+  where
+    C: CurveAffine<Base = G::Base, ScalarExt = G::Scalar>,
+    G: Group,
+  {
     // perform some curve arithmetic
-    let a = Point::<G1>::random_vartime();
-    let b = Point::<G1>::random_vartime();
+    let a = Point::<G>::random_vartime();
+    let b = Point::<G>::random_vartime();
     let c = a.add(&b);
     let d = a.double();
-    let s = <G1 as Group>::Scalar::random(&mut OsRng);
+    let s = <G as Group>::Scalar::random(&mut OsRng);
     let e = a.scalar_mul(&s);
 
-    // perform the same computation by translating to pasta_curve types
-    let a_pasta = EpAffine::from_xy(
-      pasta_curves::Fp::from_repr(a.x.to_repr()).unwrap(),
-      pasta_curves::Fp::from_repr(a.y.to_repr()).unwrap(),
+    // perform the same computation by translating to curve types
+    let a_curve = C::from_xy(
+      C::Base::from_repr(a.x.to_repr()).unwrap(),
+      C::Base::from_repr(a.y.to_repr()).unwrap(),
     )
     .unwrap();
-    let b_pasta = EpAffine::from_xy(
-      pasta_curves::Fp::from_repr(b.x.to_repr()).unwrap(),
-      pasta_curves::Fp::from_repr(b.y.to_repr()).unwrap(),
+    let b_curve = C::from_xy(
+      C::Base::from_repr(b.x.to_repr()).unwrap(),
+      C::Base::from_repr(b.y.to_repr()).unwrap(),
     )
     .unwrap();
-    let c_pasta = (a_pasta + b_pasta).to_affine();
-    let d_pasta = (a_pasta + a_pasta).to_affine();
-    let e_pasta = a_pasta
-      .mul(pasta_curves::Fq::from_repr(s.to_repr()).unwrap())
+    let c_curve = (a_curve + b_curve).to_affine();
+    let d_curve = (a_curve + a_curve).to_affine();
+    let e_curve = a_curve
+      .mul(C::Scalar::from_repr(s.to_repr()).unwrap())
       .to_affine();
 
-    // transform c, d, and e into pasta_curve types
-    let c_pasta_2 = EpAffine::from_xy(
-      pasta_curves::Fp::from_repr(c.x.to_repr()).unwrap(),
-      pasta_curves::Fp::from_repr(c.y.to_repr()).unwrap(),
+    // transform c, d, and e into curve types
+    let c_curve_2 = C::from_xy(
+      C::Base::from_repr(c.x.to_repr()).unwrap(),
+      C::Base::from_repr(c.y.to_repr()).unwrap(),
     )
     .unwrap();
-    let d_pasta_2 = EpAffine::from_xy(
-      pasta_curves::Fp::from_repr(d.x.to_repr()).unwrap(),
-      pasta_curves::Fp::from_repr(d.y.to_repr()).unwrap(),
+    let d_curve_2 = C::from_xy(
+      C::Base::from_repr(d.x.to_repr()).unwrap(),
+      C::Base::from_repr(d.y.to_repr()).unwrap(),
     )
     .unwrap();
-    let e_pasta_2 = EpAffine::from_xy(
-      pasta_curves::Fp::from_repr(e.x.to_repr()).unwrap(),
-      pasta_curves::Fp::from_repr(e.y.to_repr()).unwrap(),
+    let e_curve_2 = C::from_xy(
+      C::Base::from_repr(e.x.to_repr()).unwrap(),
+      C::Base::from_repr(e.y.to_repr()).unwrap(),
     )
     .unwrap();
 
     // check that we have the same outputs
-    assert_eq!(c_pasta, c_pasta_2);
-    assert_eq!(d_pasta, d_pasta_2);
-    assert_eq!(e_pasta, e_pasta_2);
+    assert_eq!(c_curve, c_curve_2);
+    assert_eq!(d_curve, d_curve_2);
+    assert_eq!(e_curve, e_curve_2);
   }
 
   fn synthesize_smul<G, CS>(mut cs: CS) -> (AllocatedPoint<G>, AllocatedPoint<G>, G::Scalar)
@@ -971,12 +975,20 @@ mod tests {
 
   #[test]
   fn test_ecc_circuit_ops() {
+    test_ecc_circuit_ops_with::<pallas::Point, vesta::Point>();
+    test_ecc_circuit_ops_with::<vesta::Point, pallas::Point>();
+  }
+
+  fn test_ecc_circuit_ops_with<G1, G2>()
+  where
+    G1: Group<Base = <G2 as Group>::Scalar>,
+    G2: Group<Base = <G1 as Group>::Scalar>,
+  {
     // First create the shape
     let mut cs: ShapeCS<G2> = ShapeCS::new();
     let _ = synthesize_smul::<G1, _>(cs.namespace(|| "synthesize"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let shape = cs.r1cs_shape();
-    let ck = cs.commitment_key();
+    let (shape, ck) = cs.r1cs_shape();
 
     // Then the satisfying assignment
     let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
@@ -986,12 +998,12 @@ mod tests {
     let a_p: Point<G1> = Point::new(
       a.x.get_value().unwrap(),
       a.y.get_value().unwrap(),
-      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::one(),
+      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
     );
     let e_p: Point<G1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::one(),
+      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
     );
     let e_new = a_p.scalar_mul(&s);
     assert!(e_p.x == e_new.x && e_p.y == e_new.y);
@@ -1013,12 +1025,20 @@ mod tests {
 
   #[test]
   fn test_ecc_circuit_add_equal() {
+    test_ecc_circuit_add_equal_with::<pallas::Point, vesta::Point>();
+    test_ecc_circuit_add_equal_with::<vesta::Point, pallas::Point>();
+  }
+
+  fn test_ecc_circuit_add_equal_with<G1, G2>()
+  where
+    G1: Group<Base = <G2 as Group>::Scalar>,
+    G2: Group<Base = <G1 as Group>::Scalar>,
+  {
     // First create the shape
     let mut cs: ShapeCS<G2> = ShapeCS::new();
     let _ = synthesize_add_equal::<G1, _>(cs.namespace(|| "synthesize add equal"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let shape = cs.r1cs_shape();
-    let ck = cs.commitment_key();
+    let (shape, ck) = cs.r1cs_shape();
 
     // Then the satisfying assignment
     let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
@@ -1027,12 +1047,12 @@ mod tests {
     let a_p: Point<G1> = Point::new(
       a.x.get_value().unwrap(),
       a.y.get_value().unwrap(),
-      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::one(),
+      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
     );
     let e_p: Point<G1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::one(),
+      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
     );
     let e_new = a_p.add(&a_p);
     assert!(e_p.x == e_new.x && e_p.y == e_new.y);
@@ -1049,7 +1069,7 @@ mod tests {
     inputize_allocted_point(&a, cs.namespace(|| "inputize a")).unwrap();
     let mut b = a.clone();
     b.y = AllocatedNum::alloc(cs.namespace(|| "allocate negation of a"), || {
-      Ok(G::Base::zero())
+      Ok(G::Base::ZERO)
     })
     .unwrap();
     inputize_allocted_point(&b, cs.namespace(|| "inputize b")).unwrap();
@@ -1059,12 +1079,20 @@ mod tests {
 
   #[test]
   fn test_ecc_circuit_add_negation() {
+    test_ecc_circuit_add_negation_with::<pallas::Point, vesta::Point>();
+    test_ecc_circuit_add_negation_with::<vesta::Point, pallas::Point>();
+  }
+
+  fn test_ecc_circuit_add_negation_with<G1, G2>()
+  where
+    G1: Group<Base = <G2 as Group>::Scalar>,
+    G2: Group<Base = <G1 as Group>::Scalar>,
+  {
     // First create the shape
     let mut cs: ShapeCS<G2> = ShapeCS::new();
     let _ = synthesize_add_negation::<G1, _>(cs.namespace(|| "synthesize add equal"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let shape = cs.r1cs_shape();
-    let ck = cs.commitment_key();
+    let (shape, ck) = cs.r1cs_shape();
 
     // Then the satisfying assignment
     let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
@@ -1073,7 +1101,7 @@ mod tests {
     let e_p: Point<G1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::one(),
+      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
     );
     assert!(e_p.is_infinity);
     // Make sure that it is satisfiable

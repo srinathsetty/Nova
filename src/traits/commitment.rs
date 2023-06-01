@@ -2,31 +2,13 @@
 //! We require the commitment engine to provide a commitment to vectors with a single group element
 use crate::{
   errors::NovaError,
-  traits::{AbsorbInROTrait, AppendToTranscriptTrait, Group},
+  traits::{AbsorbInROTrait, Group, TranscriptReprTrait},
 };
 use core::{
   fmt::Debug,
   ops::{Add, AddAssign, Mul, MulAssign},
 };
 use serde::{Deserialize, Serialize};
-
-/// This trait defines the behavior of commitment key
-#[allow(clippy::len_without_is_empty)]
-pub trait CommitmentKeyTrait<G: Group>:
-  Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>
-{
-  /// Holds the type of the commitment that can be produced
-  type Commitment;
-
-  /// Samples a new commitment key of a specified size
-  fn new(label: &'static [u8], n: usize) -> Self;
-
-  /// Returns the vector length that can be committed
-  fn len(&self) -> usize;
-
-  /// Commits to a vector using the commitment key
-  fn commit(&self, v: &[G::Scalar]) -> Self::Commitment;
-}
 
 /// Defines basic operations on commitments
 pub trait CommitmentOps<Rhs = Self, Output = Self>:
@@ -65,10 +47,10 @@ pub trait CommitmentTrait<G: Group>:
   + Eq
   + Send
   + Sync
+  + TranscriptReprTrait<G>
   + Serialize
   + for<'de> Deserialize<'de>
   + AbsorbInROTrait<G>
-  + AppendToTranscriptTrait<G>
   + CommitmentOps
   + CommitmentOpsOwned
   + ScalarMul<G::Scalar>
@@ -80,9 +62,9 @@ pub trait CommitmentTrait<G: Group>:
     + Eq
     + Send
     + Sync
+    + TranscriptReprTrait<G>
     + Serialize
-    + for<'de> Deserialize<'de>
-    + AppendToTranscriptTrait<G>;
+    + for<'de> Deserialize<'de>;
 
   /// Compresses self into a compressed commitment
   fn compress(&self) -> Self::CompressedCommitment;
@@ -99,10 +81,13 @@ pub trait CommitmentEngineTrait<G: Group>:
   Clone + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
   /// Holds the type of the commitment key
-  type CommitmentKey: CommitmentKeyTrait<G, Commitment = Self::Commitment>;
+  type CommitmentKey: Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>;
 
   /// Holds the type of the commitment
   type Commitment: CommitmentTrait<G>;
+
+  /// Samples a new commitment key of a specified size
+  fn setup(label: &'static [u8], n: usize) -> Self::CommitmentKey;
 
   /// Commits to the provided vector using the provided generators
   fn commit(ck: &Self::CommitmentKey, v: &[G::Scalar]) -> Self::Commitment;

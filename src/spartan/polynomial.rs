@@ -2,6 +2,7 @@
 use core::ops::Index;
 use ff::PrimeField;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 pub(crate) struct EqPolynomial<Scalar: PrimeField> {
   r: Vec<Scalar>,
@@ -17,15 +18,15 @@ impl<Scalar: PrimeField> EqPolynomial<Scalar> {
   pub fn evaluate(&self, rx: &[Scalar]) -> Scalar {
     assert_eq!(self.r.len(), rx.len());
     (0..rx.len())
-      .map(|i| rx[i] * self.r[i] + (Scalar::one() - rx[i]) * (Scalar::one() - self.r[i]))
-      .fold(Scalar::one(), |acc, item| acc * item)
+      .map(|i| rx[i] * self.r[i] + (Scalar::ONE - rx[i]) * (Scalar::ONE - self.r[i]))
+      .fold(Scalar::ONE, |acc, item| acc * item)
   }
 
   pub fn evals(&self) -> Vec<Scalar> {
     let ell = self.r.len();
-    let mut evals: Vec<Scalar> = vec![Scalar::zero(); (2_usize).pow(ell as u32)];
+    let mut evals: Vec<Scalar> = vec![Scalar::ZERO; (2_usize).pow(ell as u32)];
     let mut size = 1;
-    evals[0] = Scalar::one();
+    evals[0] = Scalar::ONE;
 
     for r in self.r.iter().rev() {
       let (evals_left, evals_right) = evals.split_at_mut(size);
@@ -45,8 +46,8 @@ impl<Scalar: PrimeField> EqPolynomial<Scalar> {
   }
 }
 
-#[derive(Debug)]
-pub(crate) struct MultilinearPolynomial<Scalar: PrimeField> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultilinearPolynomial<Scalar: PrimeField> {
   num_vars: usize, // the number of variables in the multilinear polynomial
   Z: Vec<Scalar>,  // evaluations of the polynomial in all the 2^num_vars Boolean inputs
 }
@@ -81,7 +82,7 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
         *a += *r * (*b - *a);
       });
 
-    self.Z.resize(n, Scalar::zero());
+    self.Z.resize(n, Scalar::ZERO);
     self.num_vars -= 1;
   }
 
@@ -95,7 +96,16 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
     (0..chis.len())
       .into_par_iter()
       .map(|i| chis[i] * self.Z[i])
-      .reduce(Scalar::zero, |x, y| x + y)
+      .reduce(|| Scalar::ZERO, |x, y| x + y)
+  }
+
+  pub fn evaluate_with(Z: &[Scalar], r: &[Scalar]) -> Scalar {
+    EqPolynomial::new(r.to_vec())
+      .evals()
+      .into_par_iter()
+      .zip(Z.into_par_iter())
+      .map(|(a, b)| a * b)
+      .reduce(|| Scalar::ZERO, |x, y| x + y)
   }
 }
 
@@ -120,18 +130,18 @@ impl<Scalar: PrimeField> SparsePolynomial<Scalar> {
 
   fn compute_chi(a: &[bool], r: &[Scalar]) -> Scalar {
     assert_eq!(a.len(), r.len());
-    let mut chi_i = Scalar::one();
+    let mut chi_i = Scalar::ONE;
     for j in 0..r.len() {
       if a[j] {
         chi_i *= r[j];
       } else {
-        chi_i *= Scalar::one() - r[j];
+        chi_i *= Scalar::ONE - r[j];
       }
     }
     chi_i
   }
 
-  // Takes O(n log n). TODO: do this in O(n) where n is the number of entries in Z
+  // Takes O(n log n)
   pub fn evaluate(&self, r: &[Scalar]) -> Scalar {
     assert_eq!(self.num_vars, r.len());
 
@@ -148,6 +158,6 @@ impl<Scalar: PrimeField> SparsePolynomial<Scalar> {
         let bits = get_bits(self.Z[i].0, r.len());
         SparsePolynomial::compute_chi(&bits, r) * self.Z[i].1
       })
-      .reduce(Scalar::zero, |x, y| x + y)
+      .reduce(|| Scalar::ZERO, |x, y| x + y)
   }
 }
